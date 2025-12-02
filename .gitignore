@@ -1,0 +1,10 @@
+venv/
+env/
+pycache/
+*.pyc
+foursquare_data/
+/data
+*.json
+*.db
+.env
+.DS_Store
