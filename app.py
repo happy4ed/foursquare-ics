@@ -9,12 +9,18 @@ from ics import Calendar, Event
 from ics.grammar.parse import ContentLine
 from apscheduler.schedulers.background import BackgroundScheduler
 import logging
+# [추가됨] 프록시(Caddy) 뒤에서 HTTPS를 인식하기 위한 미들웨어
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FoursquareICS")
 
 app = Flask(__name__)
+
+# [핵심 수정] 앱이 프록시 뒤에 있음을 명시 (HTTPS 인식 해결)
+# x_for=1: 실제 접속자 IP 인식, x_proto=1: HTTPS 프로토콜 인식
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # --- 환경 변수 ---
 FS_OAUTH_TOKEN = os.environ.get('FS_OAUTH_TOKEN')
@@ -96,7 +102,6 @@ def fetch_checkins_safe(after_timestamp=None, retry=3):
     offset = 0
     fetched_items = []
     
-    # 로그 메시지: 전체 가져오기인지 부분 가져오기인지 표시
     mode_msg = f"since {after_timestamp}" if after_timestamp else "ALL history (Full Sync)"
     logger.info(f"🔄 Fetching Foursquare data: {mode_msg}")
     
@@ -124,7 +129,6 @@ def fetch_checkins_safe(after_timestamp=None, retry=3):
                 if not items:
                     break
                 
-                # 가져온 개수 로그 찍기 (진행 상황 확인용)
                 logger.info(f"   - Fetched {len(items)} items (Offset: {temp_offset})")
                 
                 current_batch.extend(items)
@@ -264,7 +268,6 @@ def start_schedulers():
     scheduler.start()
     
     # 3. [스마트 동기화]
-    # DB가 비어있거나, 로컬 데이터 개수가 Foursquare 실제 개수보다 적으면 Full Sync 발동
     local_count = len(CHECKIN_DB)
     remote_count = get_foursquare_total_count()
     
