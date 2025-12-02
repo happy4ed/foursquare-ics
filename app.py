@@ -2,14 +2,13 @@ import os
 import json
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, Response, request
 import requests
 from ics import Calendar, Event
 from ics.grammar.parse import ContentLine
 from apscheduler.schedulers.background import BackgroundScheduler
 import logging
-# [추가됨] 프록시(Caddy) 뒤에서 HTTPS를 인식하기 위한 미들웨어
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # 로깅 설정
@@ -18,8 +17,7 @@ logger = logging.getLogger("FoursquareICS")
 
 app = Flask(__name__)
 
-# [핵심 수정] 앱이 프록시 뒤에 있음을 명시 (HTTPS 인식 해결)
-# x_for=1: 실제 접속자 IP 인식, x_proto=1: HTTPS 프로토콜 인식
+# 앱이 프록시 뒤에 있음을 명시 (HTTPS 인식 해결)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # --- 환경 변수 ---
@@ -29,6 +27,8 @@ PARTIAL_SYNC_MINUTES = int(os.environ.get('PARTIAL_SYNC_MINUTES', 1440))
 FULL_SYNC_MINUTES = int(os.environ.get('FULL_SYNC_MINUTES', 10080))
 DATA_DIR = os.environ.get('DATA_DIR', '/data')
 BACKUP_FILE = os.path.join(DATA_DIR, 'checkins_backup.json')
+# [기능 추가] 시작 시 데이터 강제 초기화 여부 (기본값: False)
+RESET_DB_ON_STARTUP = os.environ.get('RESET_DB_ON_STARTUP', 'false').lower() == 'true'
 
 # --- 전역 데이터 저장소 ---
 CHECKIN_DB = {}
@@ -70,17 +70,10 @@ def load_from_disk():
         logger.error(f"Failed to load backup: {e}")
 
 def get_foursquare_total_count():
-    """
-    Foursquare 사용자 프로필에서 '총 체크인 수'를 조회합니다.
-    """
     if not FS_OAUTH_TOKEN:
         return 0
-    
     url = "https://api.foursquare.com/v2/users/self"
-    params = {
-        'oauth_token': FS_OAUTH_TOKEN,
-        'v': '20231010'
-    }
+    params = {'oauth_token': FS_OAUTH_TOKEN, 'v': '20231010'}
     try:
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
@@ -100,7 +93,6 @@ def fetch_checkins_safe(after_timestamp=None, retry=3):
     url = "https://api.foursquare.com/v2/users/self/checkins"
     limit = 250
     offset = 0
-    fetched_items = []
     
     mode_msg = f"since {after_timestamp}" if after_timestamp else "ALL history (Full Sync)"
     logger.info(f"🔄 Fetching Foursquare data: {mode_msg}")
@@ -130,12 +122,10 @@ def fetch_checkins_safe(after_timestamp=None, retry=3):
                     break
                 
                 logger.info(f"   - Fetched {len(items)} items (Offset: {temp_offset})")
-                
                 current_batch.extend(items)
                 
                 if len(items) < limit:
                     break
-                
                 temp_offset += limit
             
             return current_batch
@@ -157,10 +147,13 @@ def item_to_event(item):
         event.uid = f"fq-{checkin_id}@foursquare.com"
         venue_name = venue.get('name', 'Unknown Place')
         event.name = f"@{venue_name}"
+        
         timestamp = item.get('createdAt')
         if timestamp:
-            event.begin = datetime.fromtimestamp(timestamp)
+            # [유지] 타임존 문제 해결을 위한 UTC 처리
+            event.begin = datetime.fromtimestamp(timestamp, timezone.utc)
             event.duration = {"minutes": 15}
+            
         location_parts = venue.get('location', {}).get('formattedAddress', [])
         address = ", ".join(location_parts)
         shout = item.get('shout', '')
@@ -182,6 +175,8 @@ def regenerate_ics_string():
     c = Calendar()
     c.creator = "FoursquareToICS"
     c.extra.append(ContentLine(name="X-WR-CALNAME", value=CALENDAR_NAME))
+    c.extra.append(ContentLine(name="X-WR-TIMEZONE", value="Asia/Seoul"))
+    
     with DB_LOCK:
         for event in CHECKIN_DB.values():
             c.events.add(event)
@@ -189,12 +184,9 @@ def regenerate_ics_string():
     logger.info(f"📅 ICS regenerated. Total events: {len(CHECKIN_DB)}")
 
 def perform_full_sync():
-    logger.info("🚀 --- Starting FULL SYNC (Getting ALL History) ---")
+    logger.info("🚀 --- Starting FULL SYNC ---")
     items = fetch_checkins_safe(after_timestamp=None)
-    
-    if items is None:
-        logger.warning("Full Sync failed. Skipping.")
-        return
+    if items is None: return
 
     with DB_LOCK:
         CHECKIN_DB.clear()
@@ -210,7 +202,7 @@ def perform_full_sync():
     logger.info(f"✅ FULL SYNC Completed. Total Items: {len(items)}")
 
 def perform_partial_sync():
-    logger.info("--- Starting PARTIAL SYNC (Recent 7 days) ---")
+    logger.info("--- Starting PARTIAL SYNC ---")
     seven_days_ago = datetime.now() - timedelta(days=7)
     timestamp_threshold = int(seven_days_ago.timestamp())
     
@@ -258,24 +250,35 @@ def index():
     return f"Foursquare Sync Running.<br>Total Events: {count}<br>Storage: {BACKUP_FILE}"
 
 def start_schedulers():
-    # 1. 디스크 복구 시도
+    # [기능 추가] 환경 변수 플래그가 true면, 기존 파일을 삭제하여 Full Sync 유도
+    if RESET_DB_ON_STARTUP:
+        logger.warning("🧨 RESET_DB_ON_STARTUP flag detected! Deleting local backup to force FULL SYNC.")
+        if os.path.exists(BACKUP_FILE):
+            try:
+                os.remove(BACKUP_FILE)
+                logger.info("🗑️ Checkins backup file deleted successfully.")
+            except Exception as e:
+                logger.error(f"❌ Failed to delete backup file: {e}")
+        else:
+            logger.info("ℹ️ No backup file to delete.")
+    
+    # 파일이 삭제되었다면 load_from_disk는 아무것도 하지 않고 넘어감
     load_from_disk()
     
-    # 2. 스케줄러 설정
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=perform_partial_sync, trigger="interval", minutes=PARTIAL_SYNC_MINUTES)
     scheduler.add_job(func=perform_full_sync, trigger="interval", minutes=FULL_SYNC_MINUTES)
     scheduler.start()
     
-    # 3. [스마트 동기화]
     local_count = len(CHECKIN_DB)
     remote_count = get_foursquare_total_count()
     
+    # DB가 비어있으면(리셋되었으면) 자동으로 Full Sync 시작
     if not CHECKIN_DB or local_count < remote_count:
-        logger.info(f"⚡ Data Mismatch Detected (Local: {local_count}, Remote: {remote_count}). Triggering FULL SYNC...")
+        logger.info(f"⚡ Data Mismatch/Empty (Local: {local_count}, Remote: {remote_count}). Triggering FULL SYNC...")
         threading.Thread(target=perform_full_sync).start()
     else:
-        logger.info(f"✅ Data looks consistent (Local: {local_count}). Triggering Partial Sync...")
+        logger.info(f"✅ Data looks consistent. Triggering Partial Sync...")
         threading.Thread(target=perform_partial_sync).start()
 
 if __name__ == "__main__":
